@@ -1,0 +1,38 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+[package]
+name = "trust_guard_guardrail"
+version = "1.0.15"
+rust-version = "1.88.0"
+edition = "2018"
+resolver = "2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.anypoint]
+group_id = "<your-organization-id>"
+definition_asset_id = "trust-guard-guardrail"
+implementation_asset_id = "trust-guard-guardrail-flex"
+
+[dependencies]
+pdk = { version = "1.10.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+anyhow = "1.0"
+# Already a transitive dependency of pdk (via pdk-script/pdk-pel), which uses it
+# internally -- so v4 generation via getrandom's WASI backend is already proven
+# to build for wasm32-wasip1 in this exact dependency tree.
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+pdk-test = { version = "1.10.0" }
+pdk-unit = { version = "1.10.0" }
+httpmock = "0.6"
+reqwest = "0.11"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+opt-level = 'z'
+strip = "debuginfo"

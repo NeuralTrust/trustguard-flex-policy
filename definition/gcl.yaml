@@ -1,0 +1,100 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: TrustGuard Guardrail
+    category: security
+    description: >-
+      Evaluates every prompt (input) and every model response (output) against TrustGuard
+      (NeuralTrust) before forwarding them, applying allow/report/transform/ask/block.
+    metadata/interfaceScope: api,resource
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    trustguardUrl:
+      type: string
+      format: service
+      default: "https://trustguard.neuraltrust.ai"
+      description: Base URL of your TrustGuard instance.
+    apiKey:
+      type: string
+      default: ""
+      description: TrustGuard collector API key. Masked once saved; cannot be retrieved, only overwritten.
+      "@context": {
+        "@characteristics": [
+          "security:sensitive"
+        ]
+      }
+    consumerId:
+      type: string
+      default: ""
+      description: Consumer identifier sent to TrustGuard. If left empty, falls back to this API's Exchange Asset ID.
+    providerName:
+      type: string
+      default: ""
+      description: "LLM provider name (e.g. openai, anthropic). If left empty, falls back to the x-llm-proxy-llm-provider request header when present."
+    sessionIdHeader:
+      type: string
+      default: ""
+      description: Name of a request header carrying a session/conversation id, used as TrustGuard's session_id.
+    sessionIdBodyField:
+      type: string
+      default: ""
+      description: Name of a top-level JSON field in the request body to read a session id from, if no header matched.
+    mode:
+      type: string
+      enum:
+        - enforce
+        - mirror
+      default: mirror
+      description: >-
+        "enforce" evaluates each request/response against TrustGuard before forwarding it, and can
+        block/transform traffic. "mirror" forwards every request/response unmodified immediately
+        and sends a best-effort, fire-and-forget copy to TrustGuard for passive monitoring only --
+        it never blocks or transforms traffic and adds no network latency to the real
+        request/response cycle, but TrustGuard's verdict is not read back by the gateway, so
+        findings are only visible in TrustGuard's own Activity log.
+    evaluateResponse:
+      type: boolean
+      default: true
+      description: Set to false to only evaluate the request, not the model's response.
+    timeoutMs:
+      type: integer
+      default: 2000
+      description: Timeout in milliseconds for calls to TrustGuard.
+    failMode:
+      type: string
+      enum:
+        - closed
+        - open
+      default: closed
+      description: What to do if TrustGuard is unreachable or errors out. "closed" blocks traffic (recommended for production); "open" lets it through unevaluated.
+    askBehavior:
+      type: string
+      enum:
+        - block
+        - allow
+      default: block
+      description: How to handle an "ask" verdict on the request phase, since the gateway has no interactive UI to confirm.
+    unrecognizedRequestFormat:
+      type: string
+      enum:
+        - block
+        - allow
+        - analyze
+      default: analyze
+      description: How to handle a request shape the policy can't parse structurally. "analyze" still sends the raw payload to TrustGuard as text.
+    unrecognizedResponseFormat:
+      type: string
+      enum:
+        - block
+        - allow
+        - analyze
+      default: analyze
+      description: Response-side equivalent of unrecognizedRequestFormat.
+  required:
+    - trustguardUrl
+    - apiKey
