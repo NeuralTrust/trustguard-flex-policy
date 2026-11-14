@@ -1203,6 +1203,7 @@ async fn websocket_upgrade_request_skips_evaluation_entirely() -> anyhow::Result
         .get(format!("{flex_url}/ws"))
         .header("connection", "Upgrade")
         .header("upgrade", "websocket")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
         .send()
         .await?;
 

@@ -784,16 +784,23 @@ fn path_signals_streaming(path: &str) -> bool {
 }
 
 /// Whether this request is a WebSocket upgrade, per RFC 6455: a `Connection`
-/// header whose value includes the `upgrade` token, together with an
-/// `Upgrade` header naming the target protocol. Both are required by spec,
-/// and checking both avoids mistaking an unrelated `Connection: keep-alive,
-/// Upgrade` variant some clients send for other reasons.
+/// header whose value includes the `upgrade` token, an `Upgrade: websocket`
+/// header (case-insensitive) and a `Sec-WebSocket-Key`. All are required by
+/// spec, and requiring all of them keeps a plain request that merely carries
+/// `Connection: Upgrade` plus some other `Upgrade` value from skipping
+/// evaluation (ENG-3374).
 fn is_websocket_upgrade(headers: &dyn HeadersHandler) -> bool {
     let connection_has_upgrade = headers
         .header("connection")
         .map(|v| v.to_ascii_lowercase().contains("upgrade"))
         .unwrap_or(false);
-    connection_has_upgrade && headers.header("upgrade").is_some()
+    let upgrade_is_websocket = headers
+        .header("upgrade")
+        .map(|v| v.trim().eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    connection_has_upgrade
+        && upgrade_is_websocket
+        && headers.header("sec-websocket-key").is_some()
 }
 
 async fn request_filter(
@@ -1868,14 +1875,22 @@ mod test {
 
     #[test]
     fn is_websocket_upgrade_true_for_standard_upgrade_headers() {
-        let headers = MockHeaders::new(&[("connection", "Upgrade"), ("upgrade", "websocket")]);
+        let headers = MockHeaders::new(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ]);
         assert!(is_websocket_upgrade(&headers));
     }
 
     #[test]
     fn is_websocket_upgrade_true_for_keep_alive_upgrade_connection_value() {
         // Some clients/proxies send a comma-joined Connection value.
-        let headers = MockHeaders::new(&[("connection", "keep-alive, Upgrade"), ("upgrade", "websocket")]);
+        let headers = MockHeaders::new(&[
+            ("connection", "keep-alive, Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ]);
         assert!(is_websocket_upgrade(&headers));
     }
 
@@ -1883,6 +1898,38 @@ mod test {
     fn is_websocket_upgrade_false_when_upgrade_header_missing() {
         let headers = MockHeaders::new(&[("connection", "Upgrade")]);
         assert!(!is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn is_websocket_upgrade_false_for_post_with_spoofed_upgrade_headers() {
+        // ENG-3374: a normal POST carrying `Connection: Upgrade` plus a
+        // non-websocket `Upgrade` must not skip evaluation.
+        let headers = MockHeaders::new(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "h2c"),
+            ("content-type", "application/json"),
+        ]);
+        assert!(!is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn is_websocket_upgrade_false_without_sec_websocket_key() {
+        let headers = MockHeaders::new(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("content-type", "application/json"),
+        ]);
+        assert!(!is_websocket_upgrade(&headers));
+    }
+
+    #[test]
+    fn is_websocket_upgrade_true_for_mixed_case_websocket_value() {
+        let headers = MockHeaders::new(&[
+            ("connection", "Upgrade"),
+            ("upgrade", "WebSocket"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ]);
+        assert!(is_websocket_upgrade(&headers));
     }
 
     #[test]
