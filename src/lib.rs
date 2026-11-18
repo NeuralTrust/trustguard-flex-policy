@@ -116,8 +116,9 @@ struct RequestAttrs {
     /// forwarded as it arrives and its reassembled text is only audited
     /// afterwards (see `audit_streamed_llm_output`).
     is_streaming: bool,
-    /// Whether the REQUEST was a WebSocket upgrade (`Connection: Upgrade` +
-    /// `Upgrade: <proto>`). Threaded to the response phase so BOTH legs skip
+    /// Whether the REQUEST is framed as an upgrade whose body is skipped (see
+    /// `classify_upgrade`): a genuine WebSocket handshake, or, in mirror mode
+    /// only, an unverifiable upgrade passed through unevaluated. Threaded to the response phase so BOTH legs skip
     /// body handling entirely for it -- unlike streaming, this isn't about
     /// losing coverage, it's about not hanging the connection. Confirmed
     /// live: once a connection upgrades, every frame after the handshake is
@@ -783,24 +784,51 @@ fn path_signals_streaming(path: &str) -> bool {
     path.contains(":streamGenerateContent") || path.contains("/converse-stream")
 }
 
-/// Whether this request is a WebSocket upgrade, per RFC 6455: a `Connection`
-/// header whose value includes the `upgrade` token, an `Upgrade: websocket`
-/// header (case-insensitive) and a `Sec-WebSocket-Key`. All are required by
-/// spec, and requiring all of them keeps a plain request that merely carries
-/// `Connection: Upgrade` plus some other `Upgrade` value from skipping
-/// evaluation (ENG-3374).
-fn is_websocket_upgrade(headers: &dyn HeadersHandler) -> bool {
+/// How a request relates to HTTP/1.1 upgrade framing (ENG-3374).
+#[derive(Debug, PartialEq, Eq)]
+enum UpgradeKind {
+    /// No upgrade requested, or an `h2c` upgrade, whose headers Envoy strips
+    /// before serving it as a plain request with a normal body.
+    None,
+    /// A genuine RFC 6455 WebSocket handshake: `GET`, `Connection: Upgrade`,
+    /// `Upgrade: websocket`, a `Sec-WebSocket-Key` and no body.
+    WebSocket,
+    /// Envoy frames it as an upgrade (`Connection: Upgrade` plus any other
+    /// `Upgrade` value), so its body never reaches `end_of_stream` and can't
+    /// be evaluated -- yet it isn't a genuine WebSocket handshake. Confirmed
+    /// live: a POST carrying forged handshake headers reaches the upstream
+    /// with its body unevaluated, so these are rejected in enforce mode.
+    Unverifiable,
+}
+
+fn classify_upgrade(headers: &dyn HeadersHandler) -> UpgradeKind {
     let connection_has_upgrade = headers
         .header("connection")
         .map(|v| v.to_ascii_lowercase().contains("upgrade"))
         .unwrap_or(false);
-    let upgrade_is_websocket = headers
-        .header("upgrade")
-        .map(|v| v.trim().eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-    connection_has_upgrade
-        && upgrade_is_websocket
-        && headers.header("sec-websocket-key").is_some()
+    let upgrade = headers.header("upgrade").map(|v| v.trim().to_ascii_lowercase());
+    let upgrade = match upgrade {
+        Some(u) if connection_has_upgrade && !u.is_empty() => u,
+        _ => return UpgradeKind::None,
+    };
+    if upgrade == "h2c" {
+        return UpgradeKind::None;
+    }
+
+    let is_get = headers.header(":method").is_some_and(|m| m.eq_ignore_ascii_case("GET"));
+    let has_body = headers.header("transfer-encoding").is_some()
+        || headers
+            .header("content-length")
+            .is_some_and(|v| v.trim().parse::<u64>().map_or(true, |n| n > 0));
+    let genuine = is_get
+        && !has_body
+        && upgrade == "websocket"
+        && headers.header("sec-websocket-key").is_some();
+    if genuine {
+        UpgradeKind::WebSocket
+    } else {
+        UpgradeKind::Unverifiable
+    }
 }
 
 async fn request_filter(
@@ -816,9 +844,22 @@ async fn request_filter(
     // `RequestAttrs::is_websocket_upgrade`'s doc comment for why this isn't
     // optional the way skipping streaming evaluation is -- getting this
     // wrong hangs the connection, not just loses coverage.
-    attrs.is_websocket_upgrade = is_websocket_upgrade(headers_state.handler());
-    if attrs.is_websocket_upgrade {
-        return Flow::Continue(attrs);
+    match classify_upgrade(headers_state.handler()) {
+        UpgradeKind::None => {}
+        UpgradeKind::WebSocket => {
+            attrs.is_websocket_upgrade = true;
+            return Flow::Continue(attrs);
+        }
+        UpgradeKind::Unverifiable => {
+            if !is_mirror_mode(&ctx.config) {
+                logger::warn!("rejecting upgrade request that is not a valid WebSocket handshake");
+                return block_response("upgrade request is not a valid WebSocket handshake");
+            }
+            // Mirror mode never blocks; skip the body so it can't hang.
+            logger::warn!("mirror: upgrade request is not a valid WebSocket handshake, passing it through unevaluated");
+            attrs.is_websocket_upgrade = true;
+            return Flow::Continue(attrs);
+        }
     }
 
     attrs.is_streaming = path_signals_streaming(&path);
@@ -1873,69 +1914,131 @@ mod test {
         assert!(!path_signals_streaming("/anything/echo/chat"));
     }
 
-    #[test]
-    fn is_websocket_upgrade_true_for_standard_upgrade_headers() {
-        let headers = MockHeaders::new(&[
-            ("connection", "Upgrade"),
-            ("upgrade", "websocket"),
-            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
-        ]);
-        assert!(is_websocket_upgrade(&headers));
+    const WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+
+    fn upgrade_of(headers: &[(&str, &str)]) -> UpgradeKind {
+        classify_upgrade(&MockHeaders::new(headers))
     }
 
     #[test]
-    fn is_websocket_upgrade_true_for_keep_alive_upgrade_connection_value() {
+    fn classify_upgrade_websocket_for_standard_handshake() {
+        let kind = upgrade_of(&[
+            (":method", "GET"),
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-key", WS_KEY),
+        ]);
+        assert_eq!(kind, UpgradeKind::WebSocket);
+    }
+
+    #[test]
+    fn classify_upgrade_websocket_for_keep_alive_upgrade_connection_value() {
         // Some clients/proxies send a comma-joined Connection value.
-        let headers = MockHeaders::new(&[
+        let kind = upgrade_of(&[
+            (":method", "GET"),
             ("connection", "keep-alive, Upgrade"),
             ("upgrade", "websocket"),
-            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("sec-websocket-key", WS_KEY),
         ]);
-        assert!(is_websocket_upgrade(&headers));
+        assert_eq!(kind, UpgradeKind::WebSocket);
     }
 
     #[test]
-    fn is_websocket_upgrade_false_when_upgrade_header_missing() {
-        let headers = MockHeaders::new(&[("connection", "Upgrade")]);
-        assert!(!is_websocket_upgrade(&headers));
-    }
-
-    #[test]
-    fn is_websocket_upgrade_false_for_post_with_spoofed_upgrade_headers() {
-        // ENG-3374: a normal POST carrying `Connection: Upgrade` plus a
-        // non-websocket `Upgrade` must not skip evaluation.
-        let headers = MockHeaders::new(&[
+    fn classify_upgrade_websocket_for_mixed_case_websocket_value() {
+        let kind = upgrade_of(&[
+            (":method", "GET"),
             ("connection", "Upgrade"),
+            ("upgrade", "WebSocket"),
+            ("sec-websocket-key", WS_KEY),
+        ]);
+        assert_eq!(kind, UpgradeKind::WebSocket);
+    }
+
+    #[test]
+    fn classify_upgrade_websocket_with_zero_content_length() {
+        let kind = upgrade_of(&[
+            (":method", "GET"),
+            ("connection", "Upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-key", WS_KEY),
+            ("content-length", "0"),
+        ]);
+        assert_eq!(kind, UpgradeKind::WebSocket);
+    }
+
+    #[test]
+    fn classify_upgrade_none_for_plain_request() {
+        assert_eq!(upgrade_of(&[("content-type", "application/json")]), UpgradeKind::None);
+    }
+
+    #[test]
+    fn classify_upgrade_none_when_upgrade_header_missing() {
+        assert_eq!(upgrade_of(&[(":method", "GET"), ("connection", "Upgrade")]), UpgradeKind::None);
+    }
+
+    #[test]
+    fn classify_upgrade_none_without_connection_upgrade_token() {
+        // Envoy only frames a request as an upgrade when `Connection` names it.
+        let kind = upgrade_of(&[(":method", "POST"), ("upgrade", "websocket"), ("sec-websocket-key", WS_KEY)]);
+        assert_eq!(kind, UpgradeKind::None);
+    }
+
+    #[test]
+    fn classify_upgrade_none_for_h2c() {
+        // ENG-3374: Envoy strips `h2c` upgrade headers and serves a plain
+        // request, so it must go through normal evaluation.
+        let kind = upgrade_of(&[
+            (":method", "POST"),
+            ("connection", "Upgrade, HTTP2-Settings"),
             ("upgrade", "h2c"),
             ("content-type", "application/json"),
         ]);
-        assert!(!is_websocket_upgrade(&headers));
+        assert_eq!(kind, UpgradeKind::None);
     }
 
     #[test]
-    fn is_websocket_upgrade_false_without_sec_websocket_key() {
-        let headers = MockHeaders::new(&[
+    fn classify_upgrade_unverifiable_for_post_with_all_handshake_headers() {
+        // ENG-3374: RFC 6455 handshakes are always GET.
+        let kind = upgrade_of(&[
+            (":method", "POST"),
             ("connection", "Upgrade"),
             ("upgrade", "websocket"),
+            ("sec-websocket-key", WS_KEY),
             ("content-type", "application/json"),
         ]);
-        assert!(!is_websocket_upgrade(&headers));
+        assert_eq!(kind, UpgradeKind::Unverifiable);
     }
 
     #[test]
-    fn is_websocket_upgrade_true_for_mixed_case_websocket_value() {
-        let headers = MockHeaders::new(&[
-            ("connection", "Upgrade"),
-            ("upgrade", "WebSocket"),
-            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
-        ]);
-        assert!(is_websocket_upgrade(&headers));
+    fn classify_upgrade_unverifiable_for_get_handshake_with_body() {
+        for body_header in [("content-length", "42"), ("transfer-encoding", "chunked")] {
+            let kind = upgrade_of(&[
+                (":method", "GET"),
+                ("connection", "Upgrade"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-key", WS_KEY),
+                body_header,
+            ]);
+            assert_eq!(kind, UpgradeKind::Unverifiable, "{body_header:?}");
+        }
     }
 
     #[test]
-    fn is_websocket_upgrade_false_for_plain_request() {
-        let headers = MockHeaders::new(&[("content-type", "application/json")]);
-        assert!(!is_websocket_upgrade(&headers));
+    fn classify_upgrade_unverifiable_without_sec_websocket_key() {
+        let kind = upgrade_of(&[(":method", "GET"), ("connection", "Upgrade"), ("upgrade", "websocket")]);
+        assert_eq!(kind, UpgradeKind::Unverifiable);
+    }
+
+    #[test]
+    fn classify_upgrade_unverifiable_for_other_protocol() {
+        let kind = upgrade_of(&[(":method", "GET"), ("connection", "Upgrade"), ("upgrade", "foo/1.0")]);
+        assert_eq!(kind, UpgradeKind::Unverifiable);
+    }
+
+    #[test]
+    fn classify_upgrade_unverifiable_without_method() {
+        let kind = upgrade_of(&[("connection", "Upgrade"), ("upgrade", "websocket"), ("sec-websocket-key", WS_KEY)]);
+        assert_eq!(kind, UpgradeKind::Unverifiable);
     }
 
     #[test]
